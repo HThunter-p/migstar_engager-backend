@@ -837,6 +837,69 @@ class CampaignSubscriptionTests(APITestCase):
         task = Task.objects.get(campaign_id=response.data["id"])
         self.assertEqual(task.seconds, 75)
 
+    def test_metadata_failure_is_logged_without_url_and_campaign_remains_reviewable(self):
+        self.client.force_authenticate(self.creator)
+        youtube_dl = MagicMock()
+        youtube_dl.return_value.__enter__.return_value.extract_info.side_effect = RuntimeError(
+            "extractor failed for https://www.youtube.com/watch?v=private-token"
+        )
+        with patch("engager.views.safe_public_url", return_value=True), patch(
+            "engager.views.fetch_youtube_oembed_metadata", return_value={}
+        ), patch.dict(
+            "sys.modules", {"yt_dlp": SimpleNamespace(YoutubeDL=youtube_dl)}
+        ), self.assertLogs("engager.views", level="WARNING") as captured:
+            response = self.client.post(
+                "/api/campaigns/",
+                {
+                    "platform": "YOUTUBE",
+                    "content_type": "CHANNEL",
+                    "objective": "FOLLOWERS",
+                    "budget_package": self.package.pk,
+                    "url": "https://www.youtube.com/watch?v=private-token",
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertIn("Metadata could not be fetched", response.data["admin_note"])
+        self.assertEqual(Campaign.objects.filter(pk=response.data["id"]).count(), 1)
+        self.assertNotIn("private-token", captured.output[0])
+        self.assertIn("RuntimeError", captured.output[0])
+
+    def test_youtube_oembed_fallback_supplies_title_and_thumbnail(self):
+        self.client.force_authenticate(self.creator)
+        youtube_dl = MagicMock()
+        youtube_dl.return_value.__enter__.return_value.extract_info.side_effect = RuntimeError(
+            "extractor could not retrieve YouTube metadata"
+        )
+        metadata = {
+            "title": "A YouTube short",
+            "thumbnail": "https://i.ytimg.com/vi/task-short/hqdefault.jpg",
+        }
+        with patch("engager.views.safe_public_url", return_value=True), patch(
+            "engager.views.fetch_youtube_oembed_metadata", return_value=metadata
+        ) as oembed, patch.dict(
+            "sys.modules", {"yt_dlp": SimpleNamespace(YoutubeDL=youtube_dl)}
+        ), self.assertLogs("engager.views", level="WARNING"):
+            response = self.client.post(
+                "/api/campaigns/",
+                {
+                    "platform": "YOUTUBE",
+                    "content_type": "SHORT",
+                    "objective": "FOLLOWERS",
+                    "budget_package": self.package.pk,
+                    "url": "https://www.youtube.com/shorts/task-short",
+                    "media_seconds": 60,
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["title"], metadata["title"])
+        self.assertEqual(response.data["thumbnail_url"], metadata["thumbnail"])
+        self.assertEqual(response.data["media_seconds"], 60)
+        oembed.assert_called_once_with("https://www.youtube.com/shorts/task-short")
+
     def test_campaign_subscription_requires_instructions_and_proof_then_expires(self):
         self.client.force_authenticate(self.creator)
         create_response = self.client.post(

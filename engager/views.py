@@ -1,8 +1,11 @@
 from decimal import Decimal
 from datetime import timedelta
+import logging
+import json
 import random
 import mimetypes
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
+from urllib.request import Request, urlopen
 from django.http import FileResponse
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
@@ -15,6 +18,8 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from .models import User, PlatformSettings, SubscriptionLevel, CampaignBudget, EngagerQuestion, Campaign, PaymentRequest, Task, TaskClaim, WithdrawalRequest, WalletLedger
 from .serializers import RegisterSerializer, UserSerializer, SettingsSerializer, LevelSerializer, CampaignBudgetSerializer, EngagerQuestionSerializer, CampaignSerializer, PaymentRequestSerializer, TaskSerializer, TaskClaimSerializer, WithdrawalSerializer
+
+logger = logging.getLogger(__name__)
 
 ALLOWED_HOSTS = {
     "youtube.com","www.youtube.com","youtu.be","m.youtube.com",
@@ -30,6 +35,22 @@ def safe_public_url(url):
         return p.scheme == "https" and p.hostname and p.hostname.lower() in ALLOWED_HOSTS
     except Exception:
         return False
+
+def fetch_youtube_oembed_metadata(url):
+    query = urlencode({"url": url, "format": "json"})
+    request = Request(
+        f"https://www.youtube.com/oembed?{query}",
+        headers={"User-Agent": "MIGSTAR-ENGAGER/1.0"},
+    )
+    with urlopen(request, timeout=5) as response:
+        payload = response.read(1024 * 1024 + 1)
+    if len(payload) > 1024 * 1024:
+        raise ValueError("YouTube oEmbed response exceeded the size limit.")
+    data = json.loads(payload)
+    return {
+        "title": data.get("title") or "",
+        "thumbnail": data.get("thumbnail_url") or "",
+    }
 
 def demo_ledger_balance(user):
     ledger = WalletLedger.objects.filter(user=user)
@@ -155,10 +176,34 @@ class CampaignViewSet(viewsets.ModelViewSet):
             if obj.content_type in Campaign.VIDEO_CONTENT_TYPES and duration:
                 obj.media_seconds = duration
             obj.save(update_fields=["title","thumbnail_url","media_seconds"])
-        except Exception:
-            # Keep submission for manual review if extraction is unavailable.
-            obj.admin_note = "Metadata could not be fetched automatically; please review the URL manually."
-            obj.save(update_fields=["admin_note"])
+        except Exception as error:
+            logger.warning(
+                "Campaign metadata extractor failed (campaign_id=%s platform=%s content_type=%s error_type=%s)",
+                obj.pk,
+                obj.platform,
+                obj.content_type,
+                type(error).__name__,
+            )
+            info = {}
+            if obj.platform == "YOUTUBE":
+                try:
+                    info = fetch_youtube_oembed_metadata(obj.url)
+                except Exception as fallback_error:
+                    logger.warning(
+                        "YouTube oEmbed fallback failed (campaign_id=%s error_type=%s)",
+                        obj.pk,
+                        type(fallback_error).__name__,
+                    )
+            obj.title = (info.get("title") or "")[:300]
+            obj.thumbnail_url = info.get("thumbnail") or ""
+            update_fields = ["title", "thumbnail_url"]
+            if obj.content_type in Campaign.VIDEO_CONTENT_TYPES and not obj.media_seconds:
+                obj.admin_note = "Video details were partially fetched; enter the duration manually."
+                update_fields.append("admin_note")
+            elif not obj.title and not obj.thumbnail_url:
+                obj.admin_note = "Metadata could not be fetched automatically; please review the URL manually."
+                update_fields.append("admin_note")
+            obj.save(update_fields=update_fields)
         if obj.content_type in Campaign.VIDEO_CONTENT_TYPES and not obj.media_seconds:
             obj.delete()
             raise ValidationError({"media_seconds": "Video duration could not be fetched. Enter the duration in seconds and submit again."})
