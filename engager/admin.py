@@ -53,12 +53,30 @@ class CampaignAdmin(admin.ModelAdmin):
     actions = ["approve_campaigns","reject_campaigns"]
     @admin.action(description="Approve selected campaigns")
     def approve_campaigns(self, request, queryset):
+        approved_count = 0
+        skipped_count = 0
         for c in queryset:
+            if not c.is_free_trial and not PaymentRequest.objects.filter(
+                campaign=c,
+                request_type="CAMPAIGN_BUDGET",
+                status="APPROVED",
+            ).exists():
+                skipped_count += 1
+                continue
             c.status = "APPROVED"
             c.reviewed_at = timezone.now()
             c.save(update_fields=["status","reviewed_at"])
             if c.is_free_trial:
                 c.activate_subscription()
+            approved_count += 1
+        if approved_count:
+            self.message_user(request, f"Approved {approved_count} campaign(s).", messages.SUCCESS)
+        if skipped_count:
+            self.message_user(
+                request,
+                f"Skipped {skipped_count} paid campaign(s) because payment has not been verified.",
+                messages.WARNING,
+            )
     @admin.action(description="Reject selected campaigns")
     def reject_campaigns(self, request, queryset):
         queryset.update(status="REJECTED", reviewed_at=timezone.now())

@@ -20,4 +20,6 @@ Render generates `DJANGO_SECRET_KEY` for the service. Do not commit secrets or l
 - The free web service may spin down when idle, so the first request can be slow.
 - Use only disposable demo accounts and test data. Do not collect real payment evidence or rely on this setup to retain user data.
 
+For campaigns beyond a creator's free trial slots, submission creates a campaign payment request. The super admin provides payment instructions, the creator submits transaction details and screenshot evidence, and staff must verify payment before approving the campaign.
+
 For a real launch, move to persistent database and file storage, review the production configuration, and update the frontend API URL and CORS origin.

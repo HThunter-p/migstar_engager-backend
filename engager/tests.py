@@ -366,6 +366,7 @@ class AdminReviewDashboardTests(APITestCase):
             url="https://www.youtube.com/watch?v=reviewcamp",
             status="PENDING",
             budget="400.00",
+            is_free_trial=True,
         )
         self.payment = PaymentRequest.objects.create(
             user=self.creator,
@@ -542,11 +543,29 @@ class CampaignSubscriptionTests(APITestCase):
         anonymous_response = self.client.get("/api/campaign-budgets/")
         self.assertEqual(anonymous_response.status_code, status.HTTP_401_UNAUTHORIZED)
 
-    def test_campaign_review_approval_does_not_activate_subscription(self):
+    def test_paid_campaign_requires_verified_payment_before_approval(self):
         self.campaign.status = "PENDING"
         self.campaign.save(update_fields=["status"])
         self.client.force_authenticate(self.admin)
 
+        unpaid_response = self.client.post(
+            f"/api/admin/review/campaigns/{self.campaign.pk}/",
+            {"status": "APPROVED"},
+            format="json",
+        )
+
+        self.assertEqual(unpaid_response.status_code, status.HTTP_409_CONFLICT)
+        self.assertIn("Verify the campaign payment", unpaid_response.data["detail"])
+        self.campaign.refresh_from_db()
+        self.assertEqual(self.campaign.status, "PENDING")
+
+        PaymentRequest.objects.create(
+            user=self.creator,
+            request_type="CAMPAIGN_BUDGET",
+            amount=self.campaign.budget,
+            campaign=self.campaign,
+            status="APPROVED",
+        )
         response = self.client.post(
             f"/api/admin/review/campaigns/{self.campaign.pk}/",
             {"status": "APPROVED"},
@@ -564,6 +583,63 @@ class CampaignSubscriptionTests(APITestCase):
         self.assertNotIn(self.campaign.pk, {
             campaign["id"] for campaign in self.client.get("/api/campaigns/").data
         })
+
+    def test_paid_campaign_submission_creates_payment_request_before_review(self):
+        settings_obj = PlatformSettings.current()
+        settings_obj.free_campaign_slots = 0
+        settings_obj.save(update_fields=["free_campaign_slots"])
+        youtube_dl = MagicMock()
+        youtube_dl.return_value.__enter__.return_value.extract_info.return_value = {
+            "title": "A paid campaign",
+        }
+        self.client.force_authenticate(self.creator)
+
+        with patch("engager.views.safe_public_url", return_value=True), patch.dict(
+            "sys.modules", {"yt_dlp": SimpleNamespace(YoutubeDL=youtube_dl)}
+        ):
+            response = self.client.post(
+                "/api/campaigns/",
+                {
+                    "platform": "YOUTUBE",
+                    "content_type": "CHANNEL",
+                    "objective": "FOLLOWERS",
+                    "budget_package": self.package.pk,
+                    "url": "https://www.youtube.com/@paid-campaign",
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertFalse(response.data["is_free_trial"])
+        campaign = Campaign.objects.get(pk=response.data["id"])
+        payment = PaymentRequest.objects.get(campaign=campaign)
+        self.assertEqual(payment.request_type, "CAMPAIGN_BUDGET")
+        self.assertEqual(str(payment.amount), str(self.package.amount))
+        self.assertEqual(payment.status, "PENDING")
+        self.assertEqual(response.data["status"], "PENDING")
+
+        payment.status = "REJECTED"
+        payment.save(update_fields=["status"])
+        self.client.force_authenticate(self.creator)
+        retry = self.client.post(
+            "/api/payment-requests/",
+            {
+                "request_type": "CAMPAIGN_BUDGET",
+                "amount": str(self.package.amount),
+                "campaign": campaign.pk,
+            },
+            format="json",
+        )
+        self.assertEqual(retry.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(retry.data["status"], "PENDING")
+
+        self.client.force_authenticate(self.admin)
+        approval = self.client.post(
+            f"/api/admin/review/campaigns/{campaign.pk}/",
+            {"status": "APPROVED"},
+            format="json",
+        )
+        self.assertEqual(approval.status_code, status.HTTP_409_CONFLICT)
 
     def test_creator_gets_two_free_campaign_posts_then_later_posts_are_paid(self):
         creator = User.objects.create(

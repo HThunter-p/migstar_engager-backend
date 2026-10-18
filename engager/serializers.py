@@ -172,8 +172,10 @@ class PaymentRequestSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({"level": "Campaign subscriptions do not use an engager level."})
             if campaign is None or campaign.creator_id != user.id:
                 raise serializers.ValidationError({"campaign": "Choose one of your campaigns."})
-            if campaign.status != "APPROVED":
-                raise serializers.ValidationError({"campaign": "The campaign must be approved before subscribing."})
+            if campaign.status not in {"PENDING", "APPROVED"}:
+                raise serializers.ValidationError({"campaign": "Only campaigns pending review or approved for renewal can be paid."})
+            if campaign.status == "PENDING" and campaign.is_free_trial:
+                raise serializers.ValidationError({"campaign": "Free-trial campaigns do not need a campaign payment request."})
             if not campaign.budget_package_id:
                 raise serializers.ValidationError({"campaign": "This campaign does not have an admin-configured budget."})
             if campaign.subscription_until and campaign.subscription_until > timezone.now():

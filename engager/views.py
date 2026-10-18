@@ -208,6 +208,13 @@ class CampaignViewSet(viewsets.ModelViewSet):
             obj.delete()
             raise ValidationError({"media_seconds": "Video duration could not be fetched. Enter the duration in seconds and submit again."})
         Task.objects.get_or_create(campaign=obj, defaults={"seconds": obj.task_seconds})
+        if not obj.is_free_trial:
+            PaymentRequest.objects.create(
+                user=obj.creator,
+                request_type="CAMPAIGN_BUDGET",
+                amount=obj.budget,
+                campaign=obj,
+            )
     @action(detail=True, methods=["post"], permission_classes=[permissions.IsAuthenticated])
     def submit(self, request, pk=None):
         campaign = self.get_object()
@@ -506,9 +513,14 @@ class AdminSettingsView(APIView):
 
 class AdminCampaignReviewView(StaffOnlyMixin, APIView):
     def get(self, request):
-        campaigns = Campaign.objects.select_related("creator").order_by("-created_at")
+        campaigns = Campaign.objects.select_related("creator").prefetch_related("payment_requests").order_by("-created_at")
         data = []
         for campaign in campaigns:
+            campaign_payments = [
+                payment for payment in campaign.payment_requests.all()
+                if payment.request_type == "CAMPAIGN_BUDGET"
+            ]
+            latest_payment = max(campaign_payments, key=lambda payment: payment.created_at, default=None)
             data.append({
                 "id": campaign.id,
                 "creator_username": campaign.creator.username,
@@ -525,17 +537,30 @@ class AdminCampaignReviewView(StaffOnlyMixin, APIView):
                 "target_quantity": campaign.target_quantity,
                 "subscription_days": campaign.subscription_days,
                 "subscription_until": campaign.subscription_until.isoformat() if campaign.subscription_until else None,
+                "payment_status": latest_payment.status if latest_payment else None,
                 "status": campaign.status,
                 "admin_note": campaign.admin_note,
                 "created_at": campaign.created_at.isoformat(),
             })
         return Response(data)
 
+    @transaction.atomic
     def post(self, request, pk):
-        campaign = get_object_or_404(Campaign, pk=pk)
+        campaign = get_object_or_404(Campaign.objects.select_for_update(), pk=pk)
         new_status = request.data.get("status")
         if new_status not in dict(Campaign.STATUSES):
             return Response({"detail": "Choose a valid campaign status."}, status=400)
+        if new_status == "APPROVED" and not campaign.is_free_trial:
+            payment_approved = PaymentRequest.objects.filter(
+                campaign=campaign,
+                request_type="CAMPAIGN_BUDGET",
+                status="APPROVED",
+            ).exists()
+            if not payment_approved:
+                return Response(
+                    {"detail": "Verify the campaign payment before approving this paid campaign."},
+                    status=409,
+                )
         if new_status == "REMOVED":
             notice = str(request.data.get("admin_note") or "").strip()
             if campaign.status != "APPROVED":
